@@ -15,6 +15,8 @@ export const DIVISION_OF_LABOR =
 
 const DIVISION_LINES = DIVISION_OF_LABOR.split('\n');
 const MAX_LINES = 40;
+/** v2 注入内容的安全上限（design-v2 第 7 节）；不含状态表本身。 */
+export const MAX_INJECT_LINES = 200;
 const DEFAULT_MAX_FACTS = 36;
 const KEY_WIDTH = 20;
 const VALUE_WIDTH = 32;
@@ -101,4 +103,21 @@ export function buildMemoryContext({ facts = [], scope = 'global', maxFacts } = 
   const lines = [...header, ...rows, ...DIVISION_LINES];
   // 双保险：任何输入都不超过 MAX_LINES 行
   return lines.slice(0, MAX_LINES).join('\n');
+}
+
+/**
+ * v2：状态表在前，span/topic 注入内容附在其后。
+ * injection 为空时与 buildMemoryContext 完全一致（保证 v1 行为不变）。
+ *
+ * @param {object} opts
+ * @param {Array} opts.facts
+ * @param {string} opts.scope
+ * @param {number} [opts.maxFacts]
+ * @param {string} [opts.injection] buildInjectionSync() 的 text
+ * @returns {string}
+ */
+export function composeMemoryContext({ facts = [], scope = 'global', maxFacts, injection } = {}) {
+  const base = buildMemoryContext({ facts, scope, maxFacts });
+  const extra = typeof injection === 'string' ? injection.trim() : '';
+  return extra ? `${base}\n\n${extra}` : base;
 }

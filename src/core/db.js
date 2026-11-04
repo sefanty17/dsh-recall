@@ -105,6 +105,69 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 `;
 
+/**
+ * v2 地图层 DDL：与 docs/design-v2.md 第 2 节逐字一致（冻结）。
+ * 只新增表，不动 v1 的任何表。
+ */
+const V2_DDL = `
+CREATE TABLE IF NOT EXISTS spans (
+  id            TEXT PRIMARY KEY,
+  scope         TEXT NOT NULL,
+  type          TEXT NOT NULL,        -- decision | operation | narrative
+  text          TEXT NOT NULL,        -- 模型概括（允许改写，但必须能被 evidence 支撑）
+  turns         TEXT NOT NULL,        -- JSON 数组，如 [7,9]
+  evidence      TEXT NOT NULL,        -- JSON 数组 [{session_id, seq, turn}]
+  rationale_from TEXT,                -- user | assistant | reasoning | tool
+  batch_id      TEXT,                 -- 哪次整理产出
+  session_ids   TEXT,                 -- JSON 数组
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS spans_scope ON spans (scope, type);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS span_fts USING fts5(
+  search_text, span_id UNINDEXED, tokenize = 'unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS span_vectors (
+  span_id   TEXT PRIMARY KEY,
+  model     TEXT NOT NULL,
+  dim       INTEGER NOT NULL,
+  vec       BLOB NOT NULL            -- float32 little-endian
+);
+
+CREATE TABLE IF NOT EXISTS topics (
+  id          TEXT PRIMARY KEY,
+  scope       TEXT NOT NULL,
+  slug        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  description TEXT NOT NULL,
+  file        TEXT NOT NULL,
+  span_ids    TEXT NOT NULL,         -- JSON 数组
+  content_hash TEXT,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (scope, slug)
+);
+
+CREATE TABLE IF NOT EXISTS topic_vectors (
+  topic_id TEXT PRIMARY KEY,
+  model    TEXT NOT NULL,
+  dim      INTEGER NOT NULL,
+  vec      BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS curations (
+  id         TEXT PRIMARY KEY,
+  scope      TEXT NOT NULL,
+  session_id TEXT,
+  from_seq   INTEGER,
+  to_seq     INTEGER,
+  spans      INTEGER,
+  topics     INTEGER,
+  created_at INTEGER NOT NULL
+);
+`;
+
 /** 给已存在的旧库补列；CREATE TABLE IF NOT EXISTS 不会改已有表。 */
 function ensureColumn(db, table, column, type) {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all();
@@ -120,6 +183,8 @@ export function migrate(db) {
   ensureColumn(db, 'sessions', 'mtime', 'INTEGER');
   // L2 模型抽取的幂等标记；旧库同样补齐。
   ensureColumn(db, 'sessions', 'llm_extracted_at', 'INTEGER');
+  // v2 地图层（spans / topics / vectors / curations）；全部 IF NOT EXISTS，幂等。
+  db.exec(V2_DDL);
 }
 
 /** 打开索引库：WAL + 外键 + 自动建表。 */

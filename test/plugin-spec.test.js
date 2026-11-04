@@ -5,9 +5,9 @@ import {
   MEMORY_TOOL_DESCRIPTION,
   MEMORY_TOOL_PARAMETERS,
 } from '../src/plugin/tool-spec.js';
-import { DIVISION_OF_LABOR, buildMemoryContext } from '../src/plugin/prompt.js';
+import { DIVISION_OF_LABOR, buildMemoryContext, composeMemoryContext } from '../src/plugin/prompt.js';
 
-const ACTIONS = ['state', 'history', 'search', 'read', 'write'];
+const ACTIONS = ['state', 'history', 'search', 'read', 'write', 'trace', 'recall'];
 
 const DIVISION_QUERY = '问「现在是什么 / 当时为什么 / 有没有改过」用 memory 工具';
 const DIVISION_WRITE = '用 memory(action="write") 记一条';
@@ -32,7 +32,7 @@ test('tool-spec：名字与描述', () => {
   assert.equal(MEMORY_TOOL_NAME, 'memory');
   assert.ok(MEMORY_TOOL_DESCRIPTION.length > 0);
   assert.ok([...MEMORY_TOOL_DESCRIPTION].length <= 120, `描述 ${MEMORY_TOOL_DESCRIPTION.length} 字，超过 120`);
-  for (const action of ['state', 'history', 'search', 'write']) {
+  for (const action of ACTIONS) {
     assert.ok(MEMORY_TOOL_DESCRIPTION.includes(action), `描述缺少 action: ${action}`);
   }
 });
@@ -43,13 +43,20 @@ test('tool-spec：action 参数契约完整', () => {
   assert.equal(action.required, true);
   assert.deepEqual(action.enum, ACTIONS);
   assert.ok(action.description.length > 0);
+  for (const name of ACTIONS) {
+    assert.ok(action.description.includes(name), `action 描述缺少 ${name}`);
+  }
 
-  // 四个必选 action + 可选 read 的参数都在
-  for (const field of ['query', 'key', 'content', 'scope', 'session_id']) {
+  // 可选参数都在
+  for (const field of ['query', 'question', 'key', 'content', 'scope', 'session_id']) {
     assert.equal(MEMORY_TOOL_PARAMETERS[field]?.type, 'string', `${field} 应为 string`);
   }
   assert.equal(MEMORY_TOOL_PARAMETERS.limit.type, 'number');
   assert.equal(MEMORY_TOOL_PARAMETERS.seq.type, 'number');
+  // trace 的默认当前会话 / read 的优先原生，要写进参数说明里
+  assert.match(MEMORY_TOOL_PARAMETERS.session_id.description, /trace/);
+  assert.match(MEMORY_TOOL_PARAMETERS.seq.description, /trace/);
+  assert.match(MEMORY_TOOL_PARAMETERS.question.description, /recall/);
 });
 
 test('buildMemoryContext：0 条事实', () => {
@@ -122,4 +129,25 @@ test('buildMemoryContext：没有 value 时回退到 quote', () => {
 test('buildMemoryContext：空 scope 回退 global', () => {
   const text = buildMemoryContext({ facts: [fact(0)], scope: '' });
   assert.match(text, /scope: global/);
+});
+
+test('composeMemoryContext：注入内容附在状态表之后', () => {
+  const facts = [fact(0, { key: 'pkg-manager', value: 'pnpm' })];
+  const base = buildMemoryContext({ facts, scope: 'D:\\personal_vibe\\dsh-recall' });
+  const injection = '## 相关记忆（dsh-recall）\n### 主题：依赖管理\n- [decision] 用 pnpm（第 3 轮）';
+  const text = composeMemoryContext({
+    facts,
+    scope: 'D:\\personal_vibe\\dsh-recall',
+    injection,
+  });
+  assert.ok(text.startsWith(base), '状态表必须在最前面');
+  assert.ok(text.includes(injection), '注入内容必须完整保留');
+  assert.ok(text.indexOf('## 项目记忆') < text.indexOf('## 相关记忆'));
+});
+
+test('composeMemoryContext：injection 为空时与 v1 输出一致', () => {
+  const facts = [fact(0)];
+  const base = buildMemoryContext({ facts, scope: 'global' });
+  assert.equal(composeMemoryContext({ facts, scope: 'global' }), base);
+  assert.equal(composeMemoryContext({ facts, scope: 'global', injection: '   ' }), base);
 });
