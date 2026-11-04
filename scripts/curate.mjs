@@ -1,15 +1,13 @@
 #!/usr/bin/env node
-// v2 整理 CLI：把索引库里某个会话的 turn 整理成 span + topic。
+// v3 整理 CLI：把会话文件里某个会话的 turn 整理成 span + topic。
 //
-//   node scripts/curate.mjs --db .dev/v2.db --scope <cwd> --session <id> \
+//   node scripts/curate.mjs --db .dev/v3.db --scope <cwd> --session <id> \
 //     [--turns-per-batch 5] [--max-turns 20] [--dry-run]
-//   node scripts/curate.mjs --db .dev/v2.db --scope <cwd> --latest \
-//     [--turns-per-batch 5] [--max-turns 20]
+//   node scripts/curate.mjs --db .dev/v3.db --scope <cwd> --latest \
+//     [--turns-per-batch 5] [--max-turns 20] [--topic-dir <dir>]
 //
-// 数据来源：
-//   - 会话的 events 以索引库为准；如果 sessions.path 指向的会话文件还在，优先读文件，
-//     这样能拿回 reasoning / step / 工具参数（库里只存了截断后的 text）。
-//   - --dry-run 只打印解析出的 span，不写 span / topic / curations。
+// 数据来源：直接扫描会话目录（默认 ~/.dsh/sessions）并读会话文件，
+// 能拿回 reasoning / step / 工具参数，不依赖任何 v1 索引表。
 //
 // 安全：
 //   - 凭据只从环境变量 / ~/.dsh/.credentials.yaml 读取，不打印、不写库。
@@ -20,28 +18,33 @@ import path from 'node:path';
 
 import { openDb } from '../src/core/db.js';
 import { chatJson, redactSecrets, resolveLlmConfig } from '../src/core/llm.js';
-import { readSessionFile } from '../src/core/reader.js';
+import { listSessionFiles, readSessionFile } from '../src/core/reader.js';
 import { curateSession } from '../src/core/curator.js';
 
+const DEFAULT_SESSIONS_ROOT = String(process.env.DSH_SESSIONS_ROOT ?? '').trim()
+  || path.join(os.homedir(), '.dsh', 'sessions');
+
 const DEFAULTS = {
-  db: path.resolve('.dev', 'v2.db'),
+  db: path.resolve('.dev', 'v3.db'),
   turnsPerBatch: 5,
   maxTurns: 20,
 };
 
-const HELP = `dsh-recall v2 整理（模型参与）
+const HELP = `dsh-recall v3 整理（模型参与）
 
   node scripts/curate.mjs --db <file> --scope <cwd> (--session <id> | --latest)
     [--turns-per-batch 5] [--max-turns 20] [--dry-run] [--topic-dir <dir>]
+    [--sessions-root <dir>]
 
   --db              索引库文件（默认 ${DEFAULTS.db}）
   --scope           项目 cwd；不给时用会话自己的 cwd
   --session         要整理的会话 id（也接受 session- 前缀）
-  --latest          取该 scope 最近创建的一个会话
+  --latest          取该 scope 最近修改的一个会话
   --turns-per-batch 每批几轮（默认 ${DEFAULTS.turnsPerBatch}）
-  --max-turns       最多处理最近多少轮（默认 ${DEFAULTS.maxTurns}）
+  --max-turns       最多整理最近多少轮（默认 ${DEFAULTS.maxTurns}；也可按需调小）
   --dry-run         只打印解析出的 span，不写库
   --topic-dir       topic md 输出目录（默认 ~/.dsh/recall/topics）
+  --sessions-root   会话目录（默认 ${DEFAULT_SESSIONS_ROOT}）
 
   凭据顺序：DSH_RECALL_API_KEY / DEEPSEEK_API_KEY / ~/.dsh/.credentials.yaml 的 refs.DEEPSEEK_API_KEY
   没有凭据时打印「未配置模型凭据，跳过整理」并退出（退出码 0）。
@@ -108,55 +111,34 @@ function formatSpanLine(span) {
   return `  + [${span.type}] ${prefix(span.text, 40)} (turns ${turns})`;
 }
 
-/** 会话 id 兼容带不带 session- 前缀；找不到返回 null。 */
-function findSession(db, rawId) {
-  const id = String(rawId).trim();
-  if (id === '') return null;
-  const candidates = [id];
-  if (id.startsWith('session-')) candidates.push(id.slice('session-'.length));
-  else candidates.push(`session-${id}`);
-  const statement = db.prepare(
-    'SELECT id, cwd, path, created_at FROM sessions WHERE id = ? LIMIT 1',
-  );
-  for (const candidate of candidates) {
-    const row = statement.get(candidate);
-    if (row) return row;
-  }
-  return null;
+/** 路径归一化：Windows 下大小写与斜杠不敏感。 */
+function scopeKey(value) {
+  const text = String(value ?? '').trim().replace(/[\\/]+$/, '');
+  if (!text) return '';
+  return process.platform === 'win32'
+    ? text.replace(/\//g, '\\').toLowerCase()
+    : text;
 }
 
-function latestSession(db, scope) {
-  const columns = 'SELECT id, cwd, path, created_at FROM sessions';
-  if (scope) {
-    return db.prepare(
-      `${columns} WHERE cwd = ? ORDER BY COALESCE(created_at, 0) DESC, rowid DESC LIMIT 1`,
-    ).get(scope) ?? null;
-  }
-  return db.prepare(
-    `${columns} ORDER BY COALESCE(created_at, 0) DESC, rowid DESC LIMIT 1`,
-  ).get() ?? null;
+/** 会话 id 兼容带不带 session- 前缀。 */
+function idVariants(rawId) {
+  const id = String(rawId ?? '').trim();
+  if (!id) return new Set();
+  return new Set([id, id.replace(/^session-/, ''), `session-${id}`]);
 }
 
-/**
- * 事件来源：优先会话文件（含 reasoning / step / 完整工具参数），
- * 文件不在或损坏时退回 events 表。
- */
-function loadEvents(db, session) {
-  let fileError = null;
-  if (typeof session.path === 'string' && session.path !== '') {
-    try {
-      const parsed = readSessionFile(session.path);
-      if (Array.isArray(parsed?.events)) {
-        return { events: parsed.events, source: 'session-file' };
-      }
-    } catch (err) {
-      fileError = err instanceof Error ? err.message : String(err);
-    }
-  }
-  const rows = db.prepare(
-    'SELECT seq, type, author, text, time FROM events WHERE session_id = ? ORDER BY seq',
-  ).all(session.id);
-  return { events: rows, source: 'db', fileError };
+function findSessionFile(files, rawId) {
+  const wanted = idVariants(rawId);
+  return files.find((file) => wanted.has(String(file.id))) ?? null;
+}
+
+function latestSessionFile(files, scope) {
+  const key = scopeKey(scope);
+  const candidates = key
+    ? files.filter((file) => scopeKey(file.cwd) === key)
+    : [...files];
+  candidates.sort((a, b) => Number(b.mtime) - Number(a.mtime) || String(b.path).localeCompare(String(a.path)));
+  return candidates[0] ?? null;
 }
 
 async function main() {
@@ -188,6 +170,9 @@ async function main() {
   const topicDir = typeof flags['topic-dir'] === 'string'
     ? path.resolve(expandHome(flags['topic-dir']))
     : null;
+  const sessionsRoot = path.resolve(expandHome(
+    typeof flags['sessions-root'] === 'string' ? flags['sessions-root'] : DEFAULT_SESSIONS_ROOT,
+  ));
 
   const config = resolveLlmConfig();
   if (!config.available) {
@@ -195,38 +180,44 @@ async function main() {
     return;
   }
 
-  if (!fs.existsSync(dbPath)) {
-    throw new Error(`索引库不存在：${dbPath}（先运行入库）`);
+  let files;
+  try {
+    files = listSessionFiles(sessionsRoot);
+  } catch (error) {
+    throw new Error(`扫描会话目录失败 ${sessionsRoot}：${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (files.length === 0) {
+    console.log(`[curate] ${sessionsRoot} 下没有会话文件`);
+    return;
   }
 
+  const file = hasSession
+    ? findSessionFile(files, flags.session)
+    : latestSessionFile(files, scopeFlag);
+  if (!file) {
+    console.log(hasSession
+      ? `[curate] 找不到会话：${flags.session}`
+      : `[curate] ${scopeFlag ? `scope ${scopeFlag} 下` : '会话目录里'}没有会话`);
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = readSessionFile(file.path);
+  } catch (error) {
+    throw new Error(`读取会话文件失败 ${file.path}：${error instanceof Error ? error.message : String(error)}`);
+  }
+  const scope = scopeFlag || String(parsed.header?.cwd ?? '').trim();
+  if (scope === '') throw new Error('会话没有 cwd，必须用 --scope 指定项目路径');
+
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = openDb(dbPath);
   const startedAt = process.hrtime.bigint();
 
   try {
-    let session;
-    if (hasSession) {
-      session = findSession(db, flags.session);
-      if (!session) throw new Error(`找不到会话：${flags.session}`);
-    } else {
-      session = latestSession(db, scopeFlag || null);
-      if (!session) {
-        console.log(scopeFlag ? `[curate] scope ${scopeFlag} 下没有会话` : '[curate] 库里没有会话');
-        return;
-      }
-    }
-
-    const scope = scopeFlag || (typeof session.cwd === 'string' ? session.cwd.trim() : '');
-    if (scope === '') {
-      throw new Error('会话没有 cwd，必须用 --scope 指定项目路径');
-    }
-
-    const { events, source, fileError } = loadEvents(db, session);
-    if (fileError) {
-      console.log(`[curate] 会话文件不可用（${redactSecrets(fileError)}），退回 events 表`);
-    }
     console.log(
-      `[curate] session=${session.id} scope=${scope} db=${dbPath} `
-        + `model=${config.model} 事件=${events.length}（${source}）`
+      `[curate] session=${file.id} scope=${scope} db=${dbPath} `
+        + `model=${config.model} 事件=${parsed.events.length}（session-file）`
         + `${dryRun ? ' dry-run' : ''}`,
     );
 
@@ -242,12 +233,12 @@ async function main() {
     };
 
     const stats = await curateSession(db, {
-      sessionId: session.id,
+      sessionId: file.id,
       scope,
       turnsPerBatch,
       maxTurns,
       dryRun,
-      events,
+      events: parsed.events,
       topicDir: topicDir ?? undefined,
       complete,
       onBatch: (info) => {

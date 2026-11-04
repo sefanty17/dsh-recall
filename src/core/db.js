@@ -1,115 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
 
 /**
- * DDL 冻结：与 docs/design.md 第 3 节一致（只去掉开头的 PRAGMA，那两个 PRAGMA
- * 由 openDb 在打开连接时执行）。全部 IF NOT EXISTS，可重复执行。
- *
- * 体积极化（v0.1，经确认的唯一偏离）：units 不再存 search_text 列。
- * FTS5 的 unit_fts 内部已经保存了一份分词文本，units 里再存一份纯属浪费；
- * ingest 只把 segmentCJK(text) 写进 unit_fts。
+ * v3 DDL：只保留 span / topic 地图层需要的 6 张表。
+ * 与 docs/design-v2.md 第 2 节一致（冻结）。全部 IF NOT EXISTS，可重复执行。
  */
 const DDL = `
-CREATE TABLE IF NOT EXISTS sessions (
-  id            TEXT PRIMARY KEY,
-  path          TEXT,
-  cwd           TEXT,
-  created_at    INTEGER,
-  parent_id     TEXT,
-  origin        TEXT,
-  event_count   INTEGER NOT NULL DEFAULT 0,
-  ingested_at   INTEGER,
-  mtime         INTEGER,               -- 接入层增量入库用，非 design.md 冻结字段
-  llm_extracted_at INTEGER             -- L2 模型抽取完成时间（幂等标记）
-);
-
-CREATE TABLE IF NOT EXISTS events (
-  session_id    TEXT NOT NULL,
-  seq           INTEGER NOT NULL,
-  type          TEXT NOT NULL,
-  time          INTEGER,
-  surface       TEXT,                  -- current | shadowed | log-only | NULL
-  author        TEXT,                  -- user | assistant | tool | system
-  text          TEXT,
-  PRIMARY KEY (session_id, seq)
-);
-
-CREATE TABLE IF NOT EXISTS units (
-  id            INTEGER PRIMARY KEY,
-  session_id    TEXT NOT NULL,
-  seq           INTEGER NOT NULL,
-  start         INTEGER NOT NULL,      -- 字符偏移，闭区间
-  end           INTEGER NOT NULL,
-  text          TEXT NOT NULL,
-  time          INTEGER,
-  author        TEXT,
-  surface       TEXT,
-  UNIQUE (session_id, seq, start)
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS unit_fts USING fts5(
-  search_text,
-  unit_id UNINDEXED,
-  tokenize = 'unicode61'
-);
-
-CREATE TABLE IF NOT EXISTS facts (
-  id              TEXT PRIMARY KEY,
-  key             TEXT NOT NULL,
-  value           TEXT,
-  scope           TEXT NOT NULL,       -- cwd 绝对路径，或 'global'
-  kind            TEXT NOT NULL,       -- decision|preference|constraint|failure|fact|todo
-  status          TEXT NOT NULL DEFAULT 'active',  -- active|superseded|disputed|archived
-  since           INTEGER,
-  verified_at     INTEGER,
-  drift           TEXT,                -- stable|slow|fast
-  quote           TEXT,
-  note            TEXT,                -- 模型自由文字，author 标注
-  author          TEXT NOT NULL,       -- user|agent|rule
-  verified        INTEGER NOT NULL DEFAULT 0,  -- 引文是否与原文逐字一致
-  evidence_session TEXT,
-  evidence_seq    INTEGER,
-  span_start      INTEGER,
-  span_end        INTEGER,
-  supersedes      TEXT,                -- 旧 fact id
-  superseded_by   TEXT,
-  created_at      INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS facts_key_scope ON facts (key, scope, status);
-
-CREATE TABLE IF NOT EXISTS cards (
-  id          TEXT PRIMARY KEY,
-  topic       TEXT NOT NULL,
-  scope       TEXT NOT NULL,
-  title       TEXT,
-  created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS card_quotes (
-  card_id     TEXT NOT NULL,
-  session_id  TEXT NOT NULL,
-  seq         INTEGER NOT NULL,
-  span_start  INTEGER,
-  span_end    INTEGER,
-  quote       TEXT,
-  role        TEXT,                    -- decision|reason|constraint|context
-  PRIMARY KEY (card_id, session_id, seq, role)
-);
-
-CREATE TABLE IF NOT EXISTS usage (
-  ref_type    TEXT NOT NULL,           -- fact|card|unit
-  ref_id      TEXT NOT NULL,
-  hit_count   INTEGER NOT NULL DEFAULT 0,
-  last_used   INTEGER,
-  PRIMARY KEY (ref_type, ref_id)
-);
-`;
-
-/**
- * v2 地图层 DDL：与 docs/design-v2.md 第 2 节逐字一致（冻结）。
- * 只新增表，不动 v1 的任何表。
- */
-const V2_DDL = `
 CREATE TABLE IF NOT EXISTS spans (
   id            TEXT PRIMARY KEY,
   scope         TEXT NOT NULL,
@@ -168,23 +63,32 @@ CREATE TABLE IF NOT EXISTS curations (
 );
 `;
 
-/** 给已存在的旧库补列；CREATE TABLE IF NOT EXISTS 不会改已有表。 */
-function ensureColumn(db, table, column, type) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (!columns.some((info) => info.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-  }
-}
+/**
+ * v1 遗留表：全是派生数据，可从会话文件重建。
+ * 老库升级时直接删除；新库上这些 DROP 是空操作。逐条 try/catch，
+ * 保证某张表不存在 / 被占用时不影响其余迁移。
+ */
+const LEGACY_TABLES = [
+  'facts',
+  'units',
+  'unit_fts',
+  'events',
+  'sessions',
+  'cards',
+  'card_quotes',
+  'usage',
+];
 
-/** 建表 / 建索引。幂等，可重复执行。 */
+/** 建表 / 建索引，并清掉 v1 遗留表。幂等，可重复执行。 */
 export function migrate(db) {
   db.exec(DDL);
-  // 接入层需要按文件 mtime 做增量；旧库在这里补齐。
-  ensureColumn(db, 'sessions', 'mtime', 'INTEGER');
-  // L2 模型抽取的幂等标记；旧库同样补齐。
-  ensureColumn(db, 'sessions', 'llm_extracted_at', 'INTEGER');
-  // v2 地图层（spans / topics / vectors / curations）；全部 IF NOT EXISTS，幂等。
-  db.exec(V2_DDL);
+  for (const table of LEGACY_TABLES) {
+    try {
+      db.exec(`DROP TABLE IF EXISTS ${table}`);
+    } catch {
+      // 老库锁定 / 视图依赖等极端情况：跳过即可，不影响 v2 表可用
+    }
+  }
 }
 
 /** 打开索引库：WAL + 外键 + 自动建表。 */

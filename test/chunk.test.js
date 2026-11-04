@@ -135,7 +135,7 @@ test('SQLite FTS5: 逐字切分后中文短词（2 字）能命中', () => {
   try {
     assert.doesNotThrow(() => migrate(db), 'migrate 必须可重复执行');
 
-    const insert = db.prepare('INSERT INTO unit_fts (search_text, unit_id) VALUES (?, ?)');
+    const insert = db.prepare('INSERT INTO span_fts (search_text, span_id) VALUES (?, ?)');
     insert.run(segmentCJK('这个项目作为包管理器使用的工具是 pnpm'), 1);
     insert.run(segmentCJK('服务启动需要两秒钟'), 2);
     insert.run(segmentCJK('测试命令固定用 node --test'), 3);
@@ -143,9 +143,9 @@ test('SQLite FTS5: 逐字切分后中文短词（2 字）能命中', () => {
 
     const hits = (term) => {
       const rows = db
-        .prepare('SELECT unit_id FROM unit_fts WHERE unit_fts MATCH ? ORDER BY unit_id')
+        .prepare('SELECT span_id FROM span_fts WHERE span_fts MATCH ? ORDER BY span_id')
         .all(ftsPhrase(term));
-      return rows.map((row) => Number(row.unit_id));
+      return rows.map((row) => Number(row.span_id));
     };
 
     assert.deepEqual(hits('包管理器'), [1]); // 3 字

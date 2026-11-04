@@ -1154,36 +1154,23 @@ export function groupTurns(events) {
     .map(([turn, events]) => ({ turn, events }));
 }
 
-/** 从会话文件或 events 表读原始事件；读文件是为了拿到 reasoning / step / 工具参数。 */
-function loadSessionEvents(db, sessionId, provided) {
+/**
+ * 读原始事件：调用方直接给 events，或给会话文件路径。
+ * 不再依赖索引库的 events / sessions 表（v3 已删除）。
+ */
+function loadSessionEvents(provided, sessionPath) {
   if (Array.isArray(provided)) return { events: provided, source: 'provided' };
-
-  let row = null;
-  try {
-    row = db.prepare('SELECT path FROM sessions WHERE id = ?').get(sessionId) ?? null;
-  } catch {
-    row = null;
-  }
-  if (typeof row?.path === 'string' && row.path !== '') {
+  if (typeof sessionPath === 'string' && sessionPath.trim() !== '') {
     try {
-      const parsed = readSessionFile(row.path);
+      const parsed = readSessionFile(sessionPath.trim());
       if (Array.isArray(parsed?.events)) {
         return { events: parsed.events, source: 'session-file' };
       }
     } catch {
-      // 会话文件损坏/被移走：退回 events 表
+      // 文件损坏 / 被移走：返回空，由调用方决定是否报错
     }
   }
-
-  let rows = [];
-  try {
-    rows = db.prepare(
-      'SELECT seq, type, author, text, time FROM events WHERE session_id = ? ORDER BY seq',
-    ).all(sessionId);
-  } catch {
-    rows = [];
-  }
-  return { events: rows, source: 'db' };
+  return { events: [], source: 'none' };
 }
 
 function toPositiveInt(value, fallback) {
@@ -1208,7 +1195,8 @@ function toPositiveInt(value, fallback) {
  *   maxTurns?: number,
  *   dryRun?: boolean,
  *   topicDir?: string,
- *   events?: object[],          // 测试/调用方可直接给原始事件，跳过读库
+ *   events?: object[],          // 测试/调用方可直接给原始事件，跳过读文件
+ *   sessionPath?: string,       // 或给会话文件路径，由本函数读取
  *   onBatch?: (info: object) => void,
  * }} options
  */
@@ -1232,7 +1220,7 @@ export async function curateSession(db, options = {}) {
     ? Math.trunc(maxTurnsRaw)
     : Infinity;
   const dryRun = options.dryRun === true;
-  const { events, source } = loadSessionEvents(db, sessionId, options.events);
+  const { events, source } = loadSessionEvents(options.events, options.sessionPath);
   const allTurns = groupTurns(events);
   const turns = maxTurns === Infinity ? allTurns : allTurns.slice(-maxTurns);
 

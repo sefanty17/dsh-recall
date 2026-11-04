@@ -12,6 +12,6 @@
   },
   "scripts": {
     "test": "node --test",
-    "dev": "node scripts/dev.mjs"
+    "curate": "node scripts/curate.mjs"
   }
 }
