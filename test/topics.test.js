@@ -217,6 +217,76 @@ test('upsertTopic：写 md、落 topics 表、git init + commit', (t) => {
   assert.match(log, /curate: tts-emotion/);
 });
 
+test('upsertTopic：topicDir 在别的仓库内时强制自成仓库，不污染外层', (t) => {
+  const db = makeDb(t);
+  const outer = makeDir(t);
+  const gitOpts = { encoding: 'utf8' };
+
+  // 外层项目仓库：.dev/ 被 ignore（和 dsh-recall 自己的 .gitignore 一样）
+  execFileSync('git', ['-C', outer, 'init', '-q']);
+  writeFileSync(join(outer, '.gitignore'), '.dev/\n', 'utf8');
+  writeFileSync(join(outer, 'README.md'), 'outer project\n', 'utf8');
+  execFileSync('git', ['-C', outer, 'add', '-A']);
+  execFileSync('git', [
+    '-C', outer,
+    '-c', 'user.name=outer',
+    '-c', 'user.email=outer@example.com',
+    '-c', 'commit.gpgsign=false',
+    'commit', '-m', 'outer commit',
+  ]);
+
+  const outerStatusBefore = execFileSync('git', ['-C', outer, 'status', '--porcelain'], gitOpts);
+  const outerCountBefore = execFileSync('git', ['-C', outer, 'rev-list', '--count', 'HEAD'], gitOpts).trim();
+  assert.equal(outerStatusBefore, '');
+  assert.equal(outerCountBefore, '1');
+
+  const topicDir = join(outer, '.dev', 'topics-test');
+  const payload = {
+    scope: SCOPE,
+    slug: 'nested',
+    title: '嵌套仓库',
+    description: '嵌套仓库测试',
+    spans: [{ id: 'sp_1', type: 'decision', text: '嵌套决定', turns: [1] }],
+  };
+
+  const first = upsertTopic(db, payload, { dir: topicDir });
+  assert.equal(first.git, true);
+  assert.equal(first.committed, true);
+  assert.ok(existsSync(join(topicDir, '.git')), 'topicDir 必须有自己的 .git');
+  assert.ok(existsSync(join(outer, '.git')), '外层仓库仍在');
+
+  // 外层仓库：工作区干净、index 没被 add、提交数不变
+  assert.equal(execFileSync('git', ['-C', outer, 'status', '--porcelain'], gitOpts), outerStatusBefore);
+  assert.equal(
+    execFileSync('git', ['-C', outer, 'rev-list', '--count', 'HEAD'], gitOpts).trim(),
+    outerCountBefore,
+    '外层提交数不能变',
+  );
+  assert.equal(execFileSync('git', ['-C', outer, 'diff', '--cached', '--name-only'], gitOpts), '');
+  assert.ok(
+    !execFileSync('git', ['-C', outer, 'log', '--oneline'], gitOpts).includes('curate: nested'),
+    '外层仓库不能被写进 curate 提交',
+  );
+
+  // topicDir 自己的仓库里有 curate 提交
+  const innerLog = execFileSync('git', ['-C', topicDir, 'log', '--oneline'], gitOpts);
+  assert.match(innerLog, /curate: nested/);
+
+  // 第二次 upsert：识别出 topicDir 已是独立仓库根，继续只提交自己的仓库
+  const second = upsertTopic(db, { ...payload, description: '嵌套仓库第二版' }, { dir: topicDir });
+  assert.equal(second.git, true);
+  assert.equal(second.committed, true);
+  assert.equal(
+    execFileSync('git', ['-C', topicDir, 'rev-list', '--count', 'HEAD'], gitOpts).trim(),
+    '2',
+  );
+  assert.equal(
+    execFileSync('git', ['-C', outer, 'rev-list', '--count', 'HEAD'], gitOpts).trim(),
+    outerCountBefore,
+  );
+  assert.equal(execFileSync('git', ['-C', outer, 'status', '--porcelain'], gitOpts), outerStatusBefore);
+});
+
 test('upsertTopic：没有手改时直接覆盖，同一主题复用 id 与文件', (t) => {
   const db = makeDb(t);
   const dir = makeDir(t);

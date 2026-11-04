@@ -6,13 +6,15 @@
  *   <dir>/<scopeSlug>/<slug>.md
  *
  * git 保护（第 5 节）：
- *   - 目录不是 git 仓库 → 先 git init
+ *   - dir 必须是**独立仓库根**：只是外层项目仓库里的子目录时强制 git init 一个
+ *     嵌套仓库，绝不复用外层（否则 add/commit 会动到整个项目）
  *   - 写之前 git status --porcelain -- <file>：干净 → 直接覆盖
  *   - 脏 → 以 `## ` 标题为块做三方合并（base = HEAD 里的上一版，ours = 磁盘，
- *     theirs = 本次生成）：人改过的块保留，模型新增/更新的块照常写入
+ *     theirs = 本次生成）：人改过的块保留，模型新增/更新的块照常写入；
+ *     被挤掉的模型建议写进文件末尾 `## 待合并（日期）`，每次重建不堆积
  *   - 拿不到 HEAD 版本、无法判断时 → 保留人改版本，把新内容降一级标题追加到
  *     `## 待合并` 区
- *   - 写完 git add -A && git commit -m "curate: <slug>"
+ *   - 写完 `git add -A -- .`（限定 topic 目录）&& `git commit -m "curate: <slug>"`
  *   - 任何 git 失败都不抛，只告警，返回里带 git:false
  *
  * 所有写文件测试必须传 { dir: tmpdir }，默认目录只用于真实运行：
@@ -21,7 +23,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 
@@ -474,6 +476,23 @@ function toPosixPath(value) {
   return String(value).split('\\').join('/');
 }
 
+/** 路径归一化：realpath（解 symlink / 短路径）+ 正斜杠 + Windows 小写。 */
+function normalizePath(value) {
+  let text = String(value ?? '').trim();
+  if (!text) return '';
+  try {
+    text = typeof realpathSync.native === 'function' ? realpathSync.native(text) : realpathSync(text);
+  } catch {
+    /* 路径可能还不存在：退回 resolve */
+  }
+  const normalized = resolve(text).replace(/\\/g, '/').replace(/\/+$/, '');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function samePath(a, b) {
+  return normalizePath(a) === normalizePath(b) && normalizePath(a) !== '';
+}
+
 function errorText(err) {
   const stderr = err?.stderr === undefined ? '' : String(err.stderr);
   const stdout = err?.stdout === undefined ? '' : String(err.stdout);
@@ -485,8 +504,35 @@ function warnGit(message) {
 }
 
 /**
- * 一次 git status 同时回答两个问题：这是不是仓库（能不能跑）、目标文件脏不脏。
- * 不是仓库 / git 不可用 → available:false，交给 gitInit 决定。
+ * dir 本身是不是一个独立仓库的根。
+ * 注意：`git -C <subdir> rev-parse --show-toplevel` 在 `.dev/topics` 这种
+ * 「项目内子目录」上会返回项目根 —— 那种情况必须视为 false，强制 init 嵌套仓库，
+ * 绝不复用外层仓库（否则 add/commit 会动到整个项目）。
+ */
+function isRepoRoot(dir) {
+  try {
+    const top = String(git(dir, ['rev-parse', '--show-toplevel'])).trim();
+    if (!top) return false;
+    return samePath(top, dir);
+  } catch {
+    return false;
+  }
+}
+
+/** 在 dir 里强制 init 一个独立仓库；失败只告警，不抛。 */
+function initOwnRepo(dir) {
+  try {
+    git(dir, ['init', '-q']);
+    return true;
+  } catch (err) {
+    warnGit(`git 初始化失败，跳过 git 保护（${errorText(err)}）`);
+    return false;
+  }
+}
+
+/**
+ * 一次 git status 同时回答两个问题：仓库能不能用、目标文件脏不脏。
+ * 失败 → available:false（此时不会去 add/commit）。
  */
 function gitState(dir, relativePath) {
   try {
@@ -494,17 +540,6 @@ function gitState(dir, relativePath) {
     return { available: true, dirty: out !== '' };
   } catch {
     return { available: false, dirty: true };
-  }
-}
-
-/** 不是 git 仓库就 init 一个；失败只告警，返回 false，不抛。 */
-function gitInit(dir) {
-  try {
-    git(dir, ['init', '-q']);
-    return true;
-  } catch (err) {
-    warnGit(`git 初始化失败，跳过 git 保护（${errorText(err)}）`);
-    return false;
   }
 }
 
@@ -519,7 +554,9 @@ function gitShowHead(dir, relativePath) {
 
 function gitCommit(dir, slug) {
   try {
-    git(dir, ['add', '-A']);
+    // `-- .` 把 add 限定在 topic 目录（-C 之后 `.` 相对于 dir），
+    // 绝不 stage 目录之外的东西。
+    git(dir, ['add', '-A', '--', '.']);
   } catch (err) {
     warnGit(`git add 失败（${errorText(err)}）`);
     return { ok: false, committed: false };
@@ -624,10 +661,16 @@ export function upsertTopic(db, topic, opts = {}) {
   const existingContent = existsSync(file) ? readFileSync(file, 'utf8') : null;
   const relativePath = toPosixPath(relative(dir, file));
 
-  // 一次 status 同时拿到「是不是仓库」与「文件脏不脏」。
-  let repo = gitState(dir, relativePath);
-  if (!repo.available && gitInit(dir)) {
+  // 先确保 dir 是「独立仓库根」：如果它只是外层项目仓库里的子目录，
+  // 强制 init 一个嵌套仓库（合法），绝不复用外层仓库。
+  let repo;
+  if (isRepoRoot(dir)) {
+    repo = gitState(dir, relativePath);
+  } else if (initOwnRepo(dir)) {
+    // 刚 init 的仓库没有 HEAD，已有文件一律视为脏（untracked）。
     repo = { available: true, dirty: Boolean(existingContent && existingContent.trim()) };
+  } else {
+    repo = { available: false, dirty: true };
   }
 
   let content;
