@@ -319,3 +319,57 @@ test('resolveInjection：同一 cacheKey 命中缓存，不重复调用模型', 
   assert.equal(cache.size, 0);
   db.close();
 });
+
+test('buildInjection：有重排配置时按重排分选题，阈值在重排之后生效', async () => {
+  const db = openDb(':memory:');
+  const first = insertSpans(db, [
+    { scope: SCOPE, type: 'decision', text: 'TTS 情感参数走独立配置文件', turns: [3], evidence: [] },
+  ]);
+  const second = insertSpans(db, [
+    { scope: SCOPE, type: 'narrative', text: 'TTS 情感参数导致显存溢出的排查记录', turns: [5], evidence: [] },
+  ]);
+  insertTopic(db, {
+    slug: 'tts-a',
+    title: 'TTS 情感',
+    description: 'TTS 情感参数配置',
+    spanIds: first.ids,
+  });
+  insertTopic(db, {
+    slug: 'tts-b',
+    title: 'TTS 显存',
+    description: 'TTS 情感参数排查',
+    spanIds: second.ids,
+  });
+
+  const rerankCfg = {
+    backend: 'local',
+    model: 'Xenova/bge-reranker-base',
+    url: null,
+    topN: 0,
+    available: true,
+  };
+  const seen = [];
+  const rerankFn = async ({ documents }) => {
+    seen.push(documents.map((doc) => doc.id));
+    const scores = { 'tts-a': 0.4, 'tts-b': 0.9 };
+    return documents.map((doc) => ({ id: doc.id, score: scores[doc.id] ?? 0 }));
+  };
+
+  const result = await buildInjection({
+    db,
+    scope: SCOPE,
+    question: QUESTION,
+    threshold: 0.5,
+    rerankCfg,
+    rerankFn,
+  });
+
+  assert.equal(seen.length, 1);
+  assert.deepEqual([...seen[0]].sort(), ['tts-a', 'tts-b'], '两个候选主题都要送重排');
+  assert.equal(result.skipped, 'no-selector');
+  // tts-b 重排 0.9 过阈值；tts-a 0.4 被过滤
+  assert.deepEqual(result.topicsUsed, ['tts-b']);
+  assert.ok(result.text.includes('TTS 情感参数导致显存溢出的排查记录'));
+  assert.ok(!result.text.includes('TTS 情感参数走独立配置文件'));
+  db.close();
+});
