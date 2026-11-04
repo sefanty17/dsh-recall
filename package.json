@@ -1,0 +1,17 @@
+{
+  "name": "dsh-recall",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/plugin/index.js",
+    "./plugin": "./src/plugin/index.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "dev": "node scripts/dev.mjs"
+  }
+}
