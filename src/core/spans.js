@@ -1,106 +1,38 @@
-/**
- * src/core/spans.js
- *
- * v2 span 层（语义单元）：写入、按 id / scope 列表、检索。
- * DDL 见 docs/design-v2.md 第 2 节（冻结），接口见第 6 节。
- *
- * 检索策略（与 search.js 同一套中文思路，但这里不碰它的内部函数）：
- *   1) 先用 ftsPhrase(query) 做整句 phrase 命中（最精确）
- *   2) phrase 0 结果 → 中文 bigram OR + 拉丁词 OR 回退
- *   3) 有 queryVec 且 span_vectors 有数据 → 余弦召回，与词法排序做 RRF 合并
- *
- * 分数语义（0..1，越大越相关）：
- *   - 纯词法：normalizeBm25 × coverage（coverage = 命中 bigram 数 / query bigram 总数；
- *     phrase 命中视为满覆盖 1；query 里没有中文 bigram 时也按 1）
- *   - 混合：lexical 排名 + 向量排名做 RRF（k=60），再除以榜首 RRF 归一化到 1
- *
- * 注意：searchSpans 是同步函数（接口冻结），所以要走向量召回必须由调用方传入
- * 预先算好的 queryVec（embedTexts 的返回值之一）。没传就只走词法。
- */
-
+// spans：span 的写入、读取与检索（中文 bigram 词法 + 可选向量 RRF）。
+// 接口与 DDL 见 docs/design-v2.md 第 2、6 节；searchSpans 是同步函数，向量由调用方预计算。
 import { randomUUID } from 'node:crypto';
-
 import { segmentCJK, ftsPhrase } from './chunk.js';
-
 const SPAN_TYPES = new Set(['decision', 'operation', 'narrative']);
 const RATIONALE_SOURCES = new Set(['user', 'assistant', 'reasoning', 'tool']);
-
 const DEFAULT_LIMIT = 8;
 const CANDIDATE_FACTOR = 4;
 const MIN_CANDIDATES = 32;
 const MAX_BIGRAMS = 16;
 const MAX_LATIN_TOKENS = 8;
 const RRF_K = 60;
-
-/** 连续中文段（含扩展 A 与兼容区）。 */
 const CJK_RUN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+/g;
-
-/** 拉丁词：`pnpm用哪个`、`agent_search` 都能抠出来。 */
 const LATIN_WORD = /[A-Za-z][A-Za-z0-9._-]*/g;
-
-/** 与 search.js 同源：两个停用字组成的 bigram 没有区分度。 */
 const STOP_CHARS = new Set('的了是在有和与就都也很我你他这那个用哪什么吗呢吧啊呀'.split(''));
-
-// ---------------------------------------------------------------------------
-// 小工具
-// ---------------------------------------------------------------------------
-
 function makeSpanId() {
-  // randomUUID() 去掉连字符后取前 12 位十六进制，如 sp_019c6e8faaaa。
   return `sp_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 }
-
-function collapse(text) {
-  return String(text ?? '').replace(/\s+/g, ' ').trim();
-}
-
-/** bm25 原始值为负数，|rank| 越大越相关；归一化后落在 (0,1)。 */
-function normalizeBm25(rank) {
-  if (!Number.isFinite(rank)) return 0.5;
-  const magnitude = Math.abs(rank);
-  return magnitude / (1 + magnitude);
-}
-
-/** 输入可以是数组 / JSON 字符串 / null；非法值一律 []。 */
+function collapse(text) { return String(text ?? '').replace(/\s+/g, ' ').trim(); }
+function normalizeBm25(rank) { if (!Number.isFinite(rank)) return 0.5; const magnitude = Math.abs(rank); return magnitude / (1 + magnitude); }
 function toArray(value) {
   if (Array.isArray(value)) return value;
   if (typeof value === 'string' && value.trim() !== '') {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
+    try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
   }
   return [];
 }
-
-function toIdArray(value) {
-  return toArray(value).map((item) => String(item)).filter((item) => item !== '');
-}
-
-/** turns 只保留整数；evidence 原样保留对象。 */
-function toTurns(value) {
-  return toArray(value)
-    .map((turn) => Number(turn))
-    .filter((turn) => Number.isInteger(turn));
-}
-
-function toEvidence(value) {
-  return toArray(value).filter((item) => item && typeof item === 'object' && !Array.isArray(item));
-}
-
+function toIdArray(value) { return toArray(value).map((item) => String(item)).filter((item) => item !== ''); }
+function toTurns(value) { return toArray(value) .map((turn) => Number(turn)) .filter((turn) => Number.isInteger(turn)); }
+function toEvidence(value) { return toArray(value).filter((item) => item && typeof item === 'object' && !Array.isArray(item)); }
 function parseJsonArray(raw) {
   if (raw === null || raw === undefined) return [];
   if (typeof raw !== 'string') return toArray(raw);
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+  try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
 }
-
 function rowToSpan(row) {
   if (!row) return null;
   return {
@@ -117,27 +49,18 @@ function rowToSpan(row) {
     updated_at: row.updated_at ?? null,
   };
 }
-
 function rollback(db, name) {
   try {
     db.exec(`ROLLBACK TO ${name}`);
     db.exec(`RELEASE ${name}`);
-  } catch {
-    /* 保存点已不可回滚时保留原始错误 */
-  }
+  } catch { }
 }
-
-// ---------------------------------------------------------------------------
-// 写入
-// ---------------------------------------------------------------------------
-
 const INSERT_SPAN_SQL = `
 INSERT INTO spans (
   id, scope, type, text, turns, evidence, rationale_from, batch_id,
   session_ids, created_at, updated_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
-
 function normalizeSpanInput(span, index, now) {
   if (!span || typeof span !== 'object') {
     throw new TypeError(`insertSpans: 第 ${index + 1} 条不是对象`);
@@ -160,7 +83,6 @@ function normalizeSpanInput(span, index, now) {
   const sessionIds = declaredSessions.length
     ? [...new Set(declaredSessions)]
     : [...new Set(evidenceSessions)];
-
   const scopeText = span.scope === undefined || span.scope === null ? '' : String(span.scope).trim();
   const rationale = typeof span.rationale_from === 'string' ? span.rationale_from.trim() : '';
   const batchId = typeof span.batch_id === 'string' && span.batch_id.trim() !== ''
@@ -169,8 +91,6 @@ function normalizeSpanInput(span, index, now) {
   const createdAt = Number.isFinite(Number(span.created_at)) && span.created_at !== null
     ? Math.trunc(Number(span.created_at))
     : now;
-
-  // 调用方显式给了 id 就用它（重放 / 导入场景），否则生成 sp_ + uuid 前 12 位。
   const providedId = typeof span.id === 'string' ? span.id.trim() : '';
   return {
     id: providedId || makeSpanId(),
@@ -185,24 +105,10 @@ function normalizeSpanInput(span, index, now) {
     created_at: createdAt,
   };
 }
-
-/**
- * 批量插入 span（同时写 span_fts.search_text = segmentCJK(text)）。
- * id：调用方传了就原样用，没传生成 `sp_` + uuid 前 12 位。
- * turns / evidence / session_ids 接收数组，内部 JSON.stringify。
- *
- * @param {object} db
- * @param {Array<{id?:string,type:string,text:string,turns?:number[],evidence?:object[],
- *                rationale_from?:string,batch_id?:string,session_ids?:string[],scope?:string}>} spans
- * @returns {{ inserted: number, ids: string[] }} ids 按插入顺序
- */
 export function insertSpans(db, spans) {
-  if (!db || typeof db.prepare !== 'function') {
-    throw new TypeError('insertSpans: 需要一个 SQLite 数据库实例');
-  }
+  if (!db || typeof db.prepare !== 'function') { throw new TypeError('insertSpans: 需要一个 SQLite 数据库实例'); }
   const list = Array.isArray(spans) ? spans : spans ? [spans] : [];
   if (list.length === 0) return { inserted: 0, ids: [] };
-
   const now = Date.now();
   const ids = [];
   db.exec('SAVEPOINT recall_insert_spans');
@@ -228,61 +134,30 @@ export function insertSpans(db, spans) {
       ids.push(span.id);
     }
     db.exec('RELEASE recall_insert_spans');
-  } catch (err) {
-    rollback(db, 'recall_insert_spans');
-    throw err;
-  }
+  } catch (err) { rollback(db, 'recall_insert_spans'); throw err; }
   return { inserted: ids.length, ids };
 }
-
-// ---------------------------------------------------------------------------
-// 读取
-// ---------------------------------------------------------------------------
-
-/**
- * 列出 span。
- * @param {object} db
- * @param {{scope?:string, ids?:string[], limit?:number}} [opts]
- *   scope 给了就精确过滤（'global' 也是普通 scope 值）；ids 给空数组返回 []。
- *   不传 limit 则返回全部；结果按 created_at / rowid 升序（写入顺序）。
- */
 export function listSpans(db, opts = {}) {
   const { scope, ids, limit } = opts ?? {};
   const where = [];
   const params = [];
-
-  if (scope !== undefined && scope !== null && String(scope).trim() !== '') {
-    where.push('scope = ?');
-    params.push(String(scope).trim());
-  }
+  if (scope !== undefined && scope !== null && String(scope).trim() !== '') { where.push('scope = ?'); params.push(String(scope).trim()); }
   if (Array.isArray(ids)) {
     if (ids.length === 0) return [];
     where.push(`id IN (${ids.map(() => '?').join(',')})`);
     params.push(...ids.map(String));
   }
-
   let sql = 'SELECT * FROM spans';
   if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
   sql += ' ORDER BY created_at ASC, rowid ASC';
-  if (Number.isFinite(limit) && limit > 0) {
-    sql += ' LIMIT ?';
-    params.push(Math.floor(limit));
-  }
+  if (Number.isFinite(limit) && limit > 0) { sql += ' LIMIT ?'; params.push(Math.floor(limit)); }
   return db.prepare(sql).all(...params).map(rowToSpan);
 }
-
-/** 按 id 取单条 span；不存在返回 null。turns / evidence / session_ids 已 JSON.parse。 */
 export function spanById(db, id) {
   if (typeof id !== 'string' || id.trim() === '') return null;
   const row = db.prepare('SELECT * FROM spans WHERE id = ?').get(id.trim());
   return row ? rowToSpan(row) : null;
 }
-
-// ---------------------------------------------------------------------------
-// 词法召回
-// ---------------------------------------------------------------------------
-
-/** 中文 bigram（去重、保序）。 */
 function cjkBigrams(text) {
   const seen = new Set();
   const out = [];
@@ -297,7 +172,6 @@ function cjkBigrams(text) {
   }
   return out;
 }
-
 function latinTokens(text) {
   const seen = new Set();
   const out = [];
@@ -310,20 +184,11 @@ function latinTokens(text) {
   }
   return out;
 }
-
-function isStopwordGram(gram) {
-  return STOP_CHARS.has(gram[0]) && STOP_CHARS.has(gram[1]);
-}
-
+function isStopwordGram(gram) { return STOP_CHARS.has(gram[0]) && STOP_CHARS.has(gram[1]); }
 function safeFtsPhrase(term) {
   const raw = String(term ?? '').trim();
   if (!raw) return '';
-  try {
-    const out = ftsPhrase(raw);
-    if (typeof out === 'string' && out.trim()) return out.trim();
-  } catch {
-    /* 落到下面的兜底 */
-  }
+  try { const out = ftsPhrase(raw); if (typeof out === 'string' && out.trim()) return out.trim(); } catch { }
   return `"${raw.replaceAll('"', '""')}"`;
 }
 
@@ -334,10 +199,7 @@ function lexicalQueryPlan(query) {
 
   const bigrams = cjkBigrams(query);
   const kept = bigrams.filter((gram) => !isStopwordGram(gram)).slice(0, MAX_BIGRAMS);
-  const parts = [
-    ...latinTokens(query).map((word) => safeFtsPhrase(word)),
-    ...kept.map((gram) => safeFtsPhrase(gram)),
-  ].filter(Boolean);
+  const parts = [ ...latinTokens(query).map((word) => safeFtsPhrase(word)), ...kept.map((gram) => safeFtsPhrase(gram)), ].filter(Boolean);
   const fallbackExpr = [...new Set(parts)].join(' OR ');
   if (fallbackExpr && fallbackExpr !== phrase && !attempts.some((item) => item.expr === fallbackExpr)) {
     attempts.push({ kind: 'bigram', expr: fallbackExpr });
@@ -372,17 +234,8 @@ function lexicalCandidates(db, query, scope, cap) {
          WHERE span_fts MATCH ?
          ORDER BY bm25(span_fts) LIMIT ?`;
     const params = scope ? [attempt.expr, scope, cap] : [attempt.expr, cap];
-    try {
-      rows = db.prepare(sql).all(...params);
-      lastError = null;
-    } catch (err) {
-      lastError = err;
-      rows = [];
-    }
-    if (rows.length) {
-      matchedKind = attempt.kind;
-      break;
-    }
+    try { rows = db.prepare(sql).all(...params); lastError = null; } catch (err) { lastError = err; rows = []; }
+    if (rows.length) { matchedKind = attempt.kind; break; }
   }
   if (lastError && rows.length === 0) throw lastError;
 
@@ -425,9 +278,7 @@ function loadScopedVectors(db, scope) {
       : 'SELECT span_id, model, dim, vec FROM span_vectors';
     const rows = scope ? db.prepare(sql).all(scope) : db.prepare(sql).all();
     return rows;
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 function blobToVec(blob, dim) {
@@ -522,9 +373,7 @@ export function searchSpans(db, opts = {}) {
 
   if (!hasVectors) {
     const results = [];
-    for (const [id, item] of lexicalItems) {
-      results.push({ span: item.span, score: item.score, reasons: item.reasons });
-    }
+    for (const [id, item] of lexicalItems) { results.push({ span: item.span, score: item.score, reasons: item.reasons }); }
     results.sort((a, b) => b.score - a.score);
     return results
       .filter((item) => item.score >= threshold)
@@ -541,10 +390,7 @@ export function searchSpans(db, opts = {}) {
       + (vecRank === undefined ? 0 : 1 / (RRF_K + vecRank));
     const lexicalItem = lexicalItems.get(id);
     let span = lexicalItem?.span ?? null;
-    if (!span) {
-      const row = db.prepare('SELECT * FROM spans WHERE id = ?').get(id);
-      span = row ? rowToSpan(row) : null;
-    }
+    if (!span) { const row = db.prepare('SELECT * FROM spans WHERE id = ?').get(id); span = row ? rowToSpan(row) : null; }
     if (!span) continue;
     const cosine = cosineById.get(id);
     merged.set(id, {

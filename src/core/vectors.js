@@ -1,33 +1,10 @@
-/**
- * src/core/vectors.js
- *
- * v2 向量层：embedding 配置、文本向量化、余弦相似度、float32 BLOB 存取。
- * 契约见 docs/design-v2.md 第 6 节（冻结）：
- *   resolveEmbeddingConfig(env) → { backend, model, dim, available }
- *   embedTexts(texts, cfg)      → Float32Array[] | null
- *   cosine(a, b)                → number
- *   saveSpanVectors(db, rows)   → number
- *   loadSpanVectors(db, ids)    → [{ span_id, model, dim, vec }]
- *   saveTopicVectors(db, rows)  → number
- *   loadTopicVectors(db, scope) → [{ topic_id, model, dim, vec }]
- *
- * 约定：
- * - backend 默认 none：不联网、不装包也能跑全部功能，只是没有向量召回。
- * - http 后端走 OpenAI 兼容 `POST {url}/embeddings`；key 只进 Authorization 头，
- *   绝不写进返回值、错误信息或日志。
- * - local 后端懒加载 `@huggingface/transformers`；没装包时抛固定错误文本
- *   `local embedding backend requires @huggingface/transformers`，进程不崩。
- * - 向量一律存 float32 小端 BLOB；dim 永远由实际向量长度推出（不信任调用方传的 dim）。
- */
-
+// vectors：embedding 配置 / 文本向量化 / 余弦 / float32 BLOB 存取。
+// 默认 backend=none，不联网也能跑；http 与 local 后端按需启用。
 import { createRequire } from 'node:module';
-
 const DEFAULT_MODEL = 'bge-small-zh-v1.5';
 const LOCAL_MODEL_PREFIX = 'Xenova/';
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const BACKENDS = new Set(['none', 'http', 'local']);
-
-/** 常见模型的维度；只在环境变量没显式给 DSH_RECALL_EMBED_DIM 时用作提示值。 */
 const KNOWN_DIMS = Object.freeze({
   'bge-small-zh-v1.5': 512,
   'BAAI/bge-small-zh-v1.5': 512,
@@ -40,62 +17,25 @@ const KNOWN_DIMS = Object.freeze({
   'bge-m3': 1024,
   'BAAI/bge-m3': 1024,
 });
-
-/** local 后端的 pipeline 缓存：modelId → Promise<pipeline>（并发调用只加载一次）。 */
 const localPipelines = new Map();
-
-// ---------------------------------------------------------------------------
-// 配置
-// ---------------------------------------------------------------------------
-
 function localBackendAvailable() {
-  try {
-    const require = createRequire(import.meta.url);
-    require.resolve('@huggingface/transformers');
-    return true;
-  } catch {
-    return false;
-  }
+  try { const require = createRequire(import.meta.url); require.resolve('@huggingface/transformers'); return true; } catch { return false; }
 }
-
-function envText(source, key) {
-  const value = source?.[key];
-  if (value === undefined || value === null) return '';
-  return String(value).trim();
-}
-
-/**
- * 解析 embedding 配置：
- *   DSH_RECALL_EMBED_BACKEND = none | http | local（默认 none，非法值按 none）
- *   DSH_RECALL_EMBED_MODEL   = 模型名（默认 bge-small-zh-v1.5）
- *   DSH_RECALL_EMBED_URL     = http 后端地址（OpenAI 兼容 base URL）
- *   DSH_RECALL_EMBED_DIM     = 可选，覆盖 dim 提示值
- *
- * dim 是「预期维度提示」：none 为 0，其余按显式配置 → 常见模型 → null。
- * 真正的维度以 embedTexts 返回向量的长度为准（存库时同样以实际长度为准）。
- */
+function envText(source, key) { const value = source?.[key]; if (value === undefined || value === null) return ''; return String(value).trim(); }
 export function resolveEmbeddingConfig(env = process.env) {
   const source = env && typeof env === 'object' ? env : {};
   const rawBackend = envText(source, 'DSH_RECALL_EMBED_BACKEND').toLowerCase();
   const backend = BACKENDS.has(rawBackend) ? rawBackend : 'none';
   const model = envText(source, 'DSH_RECALL_EMBED_MODEL') || DEFAULT_MODEL;
   const url = envText(source, 'DSH_RECALL_EMBED_URL') || null;
-
   const rawDim = Number(envText(source, 'DSH_RECALL_EMBED_DIM'));
   const explicitDim = Number.isFinite(rawDim) && rawDim > 0 ? Math.floor(rawDim) : null;
   const dim = backend === 'none' ? 0 : explicitDim ?? KNOWN_DIMS[model] ?? null;
-
   let available = false;
   if (backend === 'http') available = Boolean(url);
   else if (backend === 'local') available = localBackendAvailable();
-
   return { backend, model, dim, available, url };
 }
-
-// ---------------------------------------------------------------------------
-// 向量化
-// ---------------------------------------------------------------------------
-
 function normalizeConfig(cfg) {
   const base = resolveEmbeddingConfig();
   const merged = { ...base, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
@@ -107,32 +47,19 @@ function normalizeConfig(cfg) {
     url: merged.url ? String(merged.url).trim() : base.url,
   };
 }
-
 function endpointOf(url) {
   const trimmed = String(url ?? '').trim().replace(/\/+$/, '');
   if (/\/embeddings$/i.test(trimmed)) return trimmed;
   return `${trimmed}/embeddings`;
 }
-
-/** http 后端：key 只读环境变量 / cfg.apiKey，只用于请求头。 */
 async function embedHttp(list, config) {
-  if (!config.url) {
-    throw new Error('http embedding backend requires DSH_RECALL_EMBED_URL');
-  }
-  const key = String(
-    config.apiKey
-      || process.env.DSH_RECALL_EMBED_KEY
-      || process.env.OPENAI_API_KEY
-      || '',
-  ).trim();
-
+  if (!config.url) { throw new Error('http embedding backend requires DSH_RECALL_EMBED_URL'); }
+  const key = String( config.apiKey || process.env.DSH_RECALL_EMBED_KEY || process.env.OPENAI_API_KEY || '', ).trim();
   const headers = { 'content-type': 'application/json' };
   if (key) headers.authorization = `Bearer ${key}`;
-
   const timeoutMs = Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
     ? Math.floor(config.timeoutMs)
     : DEFAULT_HTTP_TIMEOUT_MS;
-
   let response;
   try {
     response = await fetch(endpointOf(config.url), {
@@ -142,15 +69,11 @@ async function embedHttp(list, config) {
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
-    // 只带底层原因，不带请求体 / 请求头（key 在那里）。
     throw new Error(`embedding request failed: ${err?.message ?? String(err)}`);
   }
-
   if (!response.ok) {
-    // 故意不回显响应体：某些服务端会在错误里回显 key。
     throw new Error(`embedding request failed: HTTP ${response.status}`);
   }
-
   const payload = await response.json();
   const data = Array.isArray(payload?.data) ? [...payload.data] : [];
   if (data.length !== list.length) {
@@ -161,63 +84,38 @@ async function embedHttp(list, config) {
   data.sort((a, b) => (a?.index ?? 0) - (b?.index ?? 0));
   return data.map((item) => Float32Array.from(item?.embedding ?? []));
 }
-
 function localModelId(model) {
   const name = String(model ?? '').trim() || DEFAULT_MODEL;
   return name.includes('/') ? name : `${LOCAL_MODEL_PREFIX}${name}`;
 }
-
-/** local 后端：动态加载 pipeline；包没装时给固定错误文本。 */
 function getLocalPipeline(model) {
   const modelId = localModelId(model);
   if (localPipelines.has(modelId)) return localPipelines.get(modelId);
-
   const loading = (async () => {
     let mod;
-    try {
-      mod = await import('@huggingface/transformers');
-    } catch (err) {
-      throw new Error('local embedding backend requires @huggingface/transformers', {
-        cause: err,
-      });
+    try { mod = await import('@huggingface/transformers'); } catch (err) {
+      throw new Error('local embedding backend requires @huggingface/transformers', { cause: err, });
     }
-    if (typeof mod?.pipeline !== 'function') {
-      throw new Error('local embedding backend requires @huggingface/transformers');
-    }
+    if (typeof mod?.pipeline !== 'function') { throw new Error('local embedding backend requires @huggingface/transformers'); }
     return mod.pipeline('feature-extraction', modelId);
   })();
-
-  // 失败时清掉缓存，允许下次重试（例如用户临时装了包）。
   loading.catch(() => localPipelines.delete(modelId));
   localPipelines.set(modelId, loading);
   return loading;
 }
-
 async function embedLocal(list, config) {
   const extractor = await getLocalPipeline(config.model);
   const output = await extractor(list, { pooling: 'mean', normalize: true });
-
   let rows;
   if (typeof output?.tolist === 'function') {
     rows = output.tolist();
-  } else if (Array.isArray(output)) {
-    rows = output;
-  } else if (output?.data && output?.dims?.length) {
+  } else if (Array.isArray(output)) { rows = output; } else if (output?.data && output?.dims?.length) {
     const width = Number(output.dims[output.dims.length - 1]) || 0;
     rows = [];
-    for (let i = 0; i < output.data.length; i += width) {
-      rows.push(Array.from(output.data.slice(i, i + width)));
-    }
-  } else {
-    throw new Error('local embedding backend returned an unsupported tensor');
-  }
+    for (let i = 0; i < output.data.length; i += width) { rows.push(Array.from(output.data.slice(i, i + width))); }
+  } else { throw new Error('local embedding backend returned an unsupported tensor'); }
   return rows.map((row) => Float32Array.from(row ?? []));
 }
-
-/**
- * 把一批文本转成向量。
- * @returns {Promise<Float32Array[]|null>} backend=none 时返回 null（调用方据此走词法路径）
- */
 export async function embedTexts(texts, cfg = {}) {
   const list = Array.isArray(texts) ? texts.map((text) => String(text ?? '')) : [];
   const config = normalizeConfig(cfg);
@@ -227,21 +125,11 @@ export async function embedTexts(texts, cfg = {}) {
   if (config.backend === 'local') return embedLocal(list, config);
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// 余弦
-// ---------------------------------------------------------------------------
-
-/**
- * 余弦相似度。长度不等、空向量、零向量、含非法分量一律返回 0（不产生 NaN）。
- * 结果截断到 [-1, 1]，吸收浮点误差。
- */
 export function cosine(a, b) {
   if (!a || !b) return 0;
   const lengthA = Number(a.length) || 0;
   const lengthB = Number(b.length) || 0;
   if (!lengthA || !lengthB || lengthA !== lengthB) return 0;
-
   let dot = 0;
   let normA = 0;
   let normB = 0;
@@ -257,24 +145,17 @@ export function cosine(a, b) {
   const sim = dot / (Math.sqrt(normA) * Math.sqrt(normB));
   return Math.max(-1, Math.min(1, sim));
 }
-
-// ---------------------------------------------------------------------------
-// BLOB 编解码（float32 little-endian）
-// ---------------------------------------------------------------------------
-
 function toFloat32(vec) {
   if (vec instanceof Float32Array) return vec;
   if (Array.isArray(vec) || ArrayBuffer.isView(vec)) return Float32Array.from(vec);
   return new Float32Array(0);
 }
-
 function vecToBlob(vec) {
   const floats = toFloat32(vec);
   const buffer = Buffer.allocUnsafe(floats.length * 4);
   for (let i = 0; i < floats.length; i += 1) buffer.writeFloatLE(floats[i], i * 4);
   return buffer;
 }
-
 function blobToVec(blob, dim) {
   const buffer = Buffer.isBuffer(blob) ? blob : Buffer.from(blob ?? []);
   const capacity = Math.floor(buffer.length / 4);
@@ -284,30 +165,20 @@ function blobToVec(blob, dim) {
   for (let i = 0; i < length; i += 1) out[i] = buffer.readFloatLE(i * 4);
   return out;
 }
-
 function rollback(db, name) {
   try {
     db.exec(`ROLLBACK TO ${name}`);
     db.exec(`RELEASE ${name}`);
-  } catch {
-    /* 保存点已不可回滚时保留原始错误 */
-  }
+  } catch { }
 }
-
-// ---------------------------------------------------------------------------
-// 存取
-// ---------------------------------------------------------------------------
-
 const UPSERT_SPAN_VECTOR = `
 INSERT INTO span_vectors (span_id, model, dim, vec) VALUES (?, ?, ?, ?)
 ON CONFLICT(span_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, vec = excluded.vec
 `;
-
 const UPSERT_TOPIC_VECTOR = `
 INSERT INTO topic_vectors (topic_id, model, dim, vec) VALUES (?, ?, ?, ?)
 ON CONFLICT(topic_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, vec = excluded.vec
 `;
-
 function saveVectors(db, rows, { table, stmtSql, idField }) {
   if (!Array.isArray(rows) || rows.length === 0) return 0;
   const savepoint = `recall_${table}_save`;
@@ -321,39 +192,16 @@ function saveVectors(db, rows, { table, stmtSql, idField }) {
       if (typeof id !== 'string' || id.trim() === '') continue;
       const floats = toFloat32(row.vec);
       if (!floats.length) continue;
-      statement.run(
-        id,
-        String(row.model ?? 'unknown'),
-        floats.length,
-        vecToBlob(floats),
-      );
+      statement.run( id, String(row.model ?? 'unknown'), floats.length, vecToBlob(floats), );
       saved += 1;
     }
     db.exec(`RELEASE ${savepoint}`);
     return saved;
-  } catch (err) {
-    rollback(db, savepoint);
-    throw err;
-  }
+  } catch (err) { rollback(db, savepoint); throw err; }
 }
-
-/**
- * 写入 / 覆盖 span 向量。rows: [{ span_id, model, dim?, vec }]
- * dim 由 vec 实际长度推出（忽略传入值）。返回写入行数。
- */
 export function saveSpanVectors(db, rows) {
-  return saveVectors(db, rows, {
-    table: 'span_vectors',
-    stmtSql: UPSERT_SPAN_VECTOR,
-    idField: 'span_id',
-  });
+  return saveVectors(db, rows, { table: 'span_vectors', stmtSql: UPSERT_SPAN_VECTOR, idField: 'span_id', });
 }
-
-/**
- * 读取 span 向量。
- * ids 省略 / null → 全部；ids 为空数组 → 空数组（显式「不要任何行」）。
- * 表不存在（旧库没 migrate）时返回 []，让上层退回词法。
- */
 export function loadSpanVectors(db, ids) {
   const filtered = Array.isArray(ids);
   if (filtered && ids.length === 0) return [];
@@ -362,30 +210,12 @@ export function loadSpanVectors(db, ids) {
       ? `SELECT span_id, model, dim, vec FROM span_vectors WHERE span_id IN (${ids.map(() => '?').join(',')})`
       : 'SELECT span_id, model, dim, vec FROM span_vectors';
     const params = filtered ? ids.map(String) : [];
-    return db.prepare(sql).all(...params).map((row) => ({
-      span_id: row.span_id,
-      model: row.model,
-      dim: row.dim,
-      vec: blobToVec(row.vec, row.dim),
-    }));
-  } catch {
-    return [];
-  }
+    return db.prepare(sql).all(...params).map((row) => ({ span_id: row.span_id, model: row.model, dim: row.dim, vec: blobToVec(row.vec, row.dim), }));
+  } catch { return []; }
 }
-
-/** 写入 / 覆盖 topic 向量。rows: [{ topic_id, model, dim?, vec }] */
 export function saveTopicVectors(db, rows) {
-  return saveVectors(db, rows, {
-    table: 'topic_vectors',
-    stmtSql: UPSERT_TOPIC_VECTOR,
-    idField: 'topic_id',
-  });
+  return saveVectors(db, rows, { table: 'topic_vectors', stmtSql: UPSERT_TOPIC_VECTOR, idField: 'topic_id', });
 }
-
-/**
- * 读取某个 scope 的 topic 向量（scope 省略 = 全部）。
- * 返回 [{ topic_id, model, dim, vec }]；表不存在时返回 []。
- */
 export function loadTopicVectors(db, scope) {
   const hasScope = scope !== undefined && scope !== null && String(scope).trim() !== '';
   try {
@@ -397,23 +227,7 @@ export function loadTopicVectors(db, scope) {
     const rows = hasScope
       ? db.prepare(sql).all(String(scope).trim())
       : db.prepare(sql).all();
-    return rows.map((row) => ({
-      topic_id: row.topic_id,
-      model: row.model,
-      dim: row.dim,
-      vec: blobToVec(row.vec, row.dim),
-    }));
-  } catch {
-    return [];
-  }
+    return rows.map((row) => ({ topic_id: row.topic_id, model: row.model, dim: row.dim, vec: blobToVec(row.vec, row.dim), }));
+  } catch { return []; }
 }
-
-export default {
-  resolveEmbeddingConfig,
-  embedTexts,
-  cosine,
-  saveSpanVectors,
-  loadSpanVectors,
-  saveTopicVectors,
-  loadTopicVectors,
-};
+export default { resolveEmbeddingConfig, embedTexts, cosine, saveSpanVectors, loadSpanVectors, saveTopicVectors, loadTopicVectors, };
