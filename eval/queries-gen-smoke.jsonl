@@ -1,0 +1,5 @@
+{"query":"这个项目为什么不用 npm 装依赖？","scope":"D:\\personal_vibe\\genq-demo","expect":{"session_id":"sess-genq-001","seq":15},"fact_id":"genq-fact-5","source":"llm"}
+{"query":"这个项目打包用哪个命令？","scope":"D:\\personal_vibe\\genq-demo","expect":{"session_id":"sess-genq-001","seq":14},"fact_id":"genq-fact-4","source":"llm"}
+{"query":"这个项目本地开发跑在哪个端口上？","scope":"D:\\personal_vibe\\genq-demo","expect":{"session_id":"sess-genq-001","seq":13},"fact_id":"genq-fact-3","source":"llm"}
+{"query":"这个项目跑测试用什么命令？","scope":"D:\\personal_vibe\\genq-demo","expect":{"session_id":"sess-genq-001","seq":12},"fact_id":"genq-fact-2","source":"llm"}
+{"query":"这个项目装依赖用哪个包管理器？","scope":"D:\\personal_vibe\\genq-demo","expect":{"session_id":"sess-genq-001","seq":11},"fact_id":"genq-fact-1","source":"llm"}

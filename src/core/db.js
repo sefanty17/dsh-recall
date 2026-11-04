@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   origin        TEXT,
   event_count   INTEGER NOT NULL DEFAULT 0,
   ingested_at   INTEGER,
-  mtime         INTEGER                -- 接入层增量入库用，非 design.md 冻结字段
+  mtime         INTEGER,               -- 接入层增量入库用，非 design.md 冻结字段
+  llm_extracted_at INTEGER             -- L2 模型抽取完成时间（幂等标记）
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -117,6 +118,8 @@ export function migrate(db) {
   db.exec(DDL);
   // 接入层需要按文件 mtime 做增量；旧库在这里补齐。
   ensureColumn(db, 'sessions', 'mtime', 'INTEGER');
+  // L2 模型抽取的幂等标记；旧库同样补齐。
+  ensureColumn(db, 'sessions', 'llm_extracted_at', 'INTEGER');
 }
 
 /** 打开索引库：WAL + 外键 + 自动建表。 */

@@ -6,8 +6,9 @@
  *
  * 语义：
  *   - 单值键：同 (key, scope) 同时只有一条 active
- *   - 多值键（kind='constraint' 或 key='never-use'）：唯一性键是 (key, value, scope)，
- *     不同值的约束各自 active、互不取代；同值重复写入只刷新确认时间
+ *   - 多值键（kind='constraint'、key='never-use'、key='note' 或 value 为 null）：
+ *     约束按 (key, value, scope) 去重，同一约束换句话说不重复；
+ *     note / value=null 按 (key, value, scope, quote) 去重，不同原文是不同事实
  *   - 同值重复写入 = 「再次确认」：只刷新 verified_at / verified，不新增行
  *   - 不同值（仅单值键）= 新版本：新行 active + supersedes=旧id；旧行 superseded + superseded_by=新id
  *   - 旧行永不删除，factHistory 可回放整条链
@@ -78,18 +79,31 @@ export function upsertFact(db, fact) {
   const value = fact.value === null || fact.value === undefined ? null : String(fact.value);
   const createdAt = toEpoch(fact.created_at) ?? Date.now();
   const kind = typeof fact.kind === 'string' && fact.kind ? fact.kind : 'fact';
-  // 多值键：约束之间互不取代，唯一性键是 (key, value, scope)
-  const multiValue = kind === 'constraint' || key === 'never-use';
+  const quote = toTextOrNull(fact.quote);
+  // 多值键：约束、never-use、note、以及所有 value 为 null 的事实互不取代。
+  // note / value=null 的唯一性键含 quote（不同原文是不同事实）；
+  // 约束仍按 value 去重（同一约束换句话说不重复成两条）。
+  const quoteScoped = key === 'note' || value === null;
+  const multiValue = kind === 'constraint'
+    || key === 'never-use'
+    || quoteScoped;
 
   db.exec('SAVEPOINT recall_upsert_fact');
   try {
-    const old = multiValue
-      ? db.prepare(
+    let old;
+    if (quoteScoped) {
+      old = db.prepare(
+        "SELECT * FROM facts WHERE key = ? AND scope = ? AND value IS ? AND quote IS ? AND status = 'active' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      ).get(key, scope, value, quote);
+    } else if (multiValue) {
+      old = db.prepare(
         "SELECT * FROM facts WHERE key = ? AND scope = ? AND value IS ? AND status = 'active' ORDER BY created_at DESC, rowid DESC LIMIT 1",
-      ).get(key, scope, value)
-      : db.prepare(
+      ).get(key, scope, value);
+    } else {
+      old = db.prepare(
         "SELECT * FROM facts WHERE key = ? AND scope = ? AND status = 'active' ORDER BY created_at DESC, rowid DESC LIMIT 1",
       ).get(key, scope);
+    }
 
     if (!old) {
       const inserted = insertFact(db, fact, {
@@ -104,7 +118,7 @@ export function upsertFact(db, fact) {
     }
 
     // 命中旧事实：
-    // - 多值键：查到的必然是同值约束，只刷新确认时间
+    // - 多值键：约束按 value 命中、note 按 value+quote 命中，都只刷新确认时间
     // - 单值键：同值同样只刷新，不产生新版本
     if (multiValue || (old.value === null ? null : String(old.value)) === value) {
       const verifiedAt = toEpoch(fact.verified_at) ?? Date.now();

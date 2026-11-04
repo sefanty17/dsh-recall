@@ -255,6 +255,30 @@ test('keyHint 关键词必须靠近触发词，否则 note', () => {
   assert.equal(near[0].drift, 'slow');
 });
 
+test('命令类 key 允许单空格 value', () => {
+  const cargoTest = scanText('测试命令固定用 cargo test。');
+  assert.equal(cargoTest.length, 1, JSON.stringify(cargoTest));
+  assert.equal(cargoTest[0].keyHint, 'test-command');
+  assert.equal(cargoTest[0].value, 'cargo test');
+
+  const goTest = scanText('测试统一用 go test ./...。');
+  assert.equal(goTest[0].keyHint, 'test-command');
+  assert.equal(goTest[0].value, 'go test ./...');
+
+  const goBuild = scanText('构建统一走 go build ./...。');
+  assert.equal(goBuild[0].keyHint, 'build-command');
+  assert.equal(goBuild[0].value, 'go build ./...');
+
+  const deploy = scanText('部署统一走 make deploy。');
+  assert.equal(deploy[0].keyHint, 'deploy');
+  assert.equal(deploy[0].value, 'make deploy');
+
+  // 非命令 key 仍然只取第一个标识符
+  const pkg = scanText('以后统一用 pnpm run dev。');
+  assert.equal(pkg[0].keyHint, 'pkg-manager');
+  assert.equal(pkg[0].value, 'pnpm');
+});
+
 test('单段文本最多返回 20 条', () => {
   const text = Array.from({ length: 30 }, (_, i) => `以后统一用 pkg${i}。`).join('\n');
   const candidates = scanText(text);

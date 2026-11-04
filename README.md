@@ -65,14 +65,33 @@ node scripts/dev.mjs history pkg-manager --scope "D:\personal_vibe"
 node scripts/eval.mjs                             # 手写查询集（manual，默认）
 node scripts/eval.mjs --auto --max-queries 100    # 从 facts.quote 片段测索引自洽性
 node scripts/eval.mjs --auto --manual             # auto / manual 两组分开报告
+node scripts/gen-queries.mjs --db .dev/l2.db --out eval/queries-gen.jsonl   # 模型把事实改写成自然问题
+node scripts/eval.mjs --queries eval/queries-gen.jsonl --db .dev/l2.db      # 自然问句的 Hit@1 / MRR
 ```
 
 默认库是 `./.dev/index.db`，`--db` 可换；`--root` 可换会话目录。测试：`node --test`。
 
+## L2 模型抽取（可选）
+
+规则抽取只认高置信句式，覆盖有限。L2 用宿主模型（DeepSeek 的 OpenAI 兼容接口）把用户消息再读一遍：只处理用户真正说的话，引文必须逐字命中原文，否则丢弃；没有值得记的就返回空。
+
+```bash
+# 先用只读副本预览（会真实调用模型，但不写库）
+node scripts/extract.mjs --db .dev/l2.db --root .data/sessions-copy --max-sessions 3 --dry-run
+
+# 正式写入；--project 只处理某个 cwd，--force 重抽已处理会话
+node scripts/extract.mjs --db .dev/l2.db --root .data/sessions-copy --max-sessions 20
+node scripts/extract.mjs --db .dev/l2.db --root .data/sessions-copy --project "D:\personal_vibe\companion"
+```
+
+凭据读取顺序：`DSH_RECALL_API_KEY` → `DEEPSEEK_API_KEY` → `~/.dsh/.credentials.yaml` 的 `refs.DEEPSEEK_API_KEY`（字面量或 `env:NAME` 都支持）。没有凭据时打印「未配置模型凭据，跳过 L2」并以 0 退出，不会崩。密钥不打印、不写库。
+
+会话目录只读，`--root` 默认 `.data/sessions-copy`。处理完的会话写 `sessions.llm_extracted_at`，下次自动跳过；`--force` 可重跑。抽取出的 fact 标为 `author='llm'`、`verified=1`（引文已校验），和规则事实共用同一套 supersede / history。
+
 ## 已知限制
 
 - **scope 是 cwd 精确匹配**：在 `D:\proj\sub` 里看不到 `D:\proj` 的记忆；暂时没有父子目录继承。
-- **只做规则抽取，没有模型参与**：覆盖率有限，真实项目常常只有 0–3 条；主要靠模型在对话里主动 `memory(action="write")`。
+- **默认只有规则抽取**：覆盖率有限，真实项目常常只有 0–3 条；L2 模型抽取要显式运行 `scripts/extract.mjs`（见上），平时也可让模型在对话里主动 `memory(action="write")`。
 - **索引是派生数据，可随时删除重建**：`node:sqlite` + 全量 unit 文本，语料大时库会比较大（256 个会话约 1 GB），重建需重新入库。
 - **首次全量入库在后台慢慢跑**：解码/写库在 worker 里按批进行，不阻塞主线程（实测单次事件循环停顿约 100ms）；会话多时总时长可能几十秒，当前项目会优先入库。
 

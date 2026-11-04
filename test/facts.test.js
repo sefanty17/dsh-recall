@@ -195,3 +195,65 @@ test('单值键行为不变：pkg-manager pnpm -> bun 仍然 supersede', (t) => 
     ['bun', 'active'],
   ]);
 });
+
+test('约束按 value 去重：同值不同 quote 仍合并', (t) => {
+  const db = makeDb(t);
+  const mk = (quote, created_at) => fact({
+    key: 'never-use',
+    kind: 'constraint',
+    value: 'high',
+    author: 'user',
+    quote,
+    created_at,
+  });
+
+  const first = upsertFact(db, mk('不许标 high**', 1000));
+  const second = upsertFact(db, mk('不要标 high 壮胆', 2000));
+  assert.equal(second.fact.id, first.fact.id, '同一约束换句话说不应重复成两条');
+  assert.equal(listFacts(db, { scope: SCOPE, key: 'never-use' }).length, 1);
+});
+
+test('note 是多值键：不同 quote 各自 active，同 quote 只刷新', async (t) => {
+  const db = makeDb(t);
+  const mk = (quote, overrides = {}) => fact({
+    key: 'note',
+    value: null,
+    kind: 'fact',
+    author: 'llm',
+    quote,
+    ...overrides,
+  });
+
+  const first = upsertFact(db, mk('第一条 note 的原文', { created_at: 1000 }));
+  const second = upsertFact(db, mk('第二条 note 的原文', { created_at: 2000 }));
+  const third = upsertFact(db, mk('第三条 note 的原文', { created_at: 3000 }));
+  for (const result of [first, second, third]) {
+    assert.equal(result.superseded, null, 'note 之间不应互相 supersede');
+  }
+
+  assert.equal(listFacts(db, { scope: SCOPE, key: 'note' }).length, 3);
+  assert.equal(listFacts(db, { scope: SCOPE, status: 'superseded' }).length, 0);
+
+  // note 不进常驻状态表
+  const state = String(await createService({ db, scope: SCOPE }).state());
+  assert.match(state, /0 active facts/);
+
+  // 同一条 note 重复写入 -> 不新增，只刷新
+  const again = upsertFact(db, mk('第二条 note 的原文', {
+    created_at: 4000,
+    verified_at: 4000,
+  }));
+  assert.equal(again.superseded, null);
+  assert.equal(again.fact.id, second.fact.id, '同 quote 应复用旧行');
+  assert.equal(again.fact.verified_at, 4000);
+  assert.equal(listFacts(db, { scope: SCOPE, key: 'note' }).length, 3);
+
+  const history = factHistory(db, { key: 'note', scope: SCOPE });
+  assert.equal(history.length, 3);
+  assert.deepEqual(history.map((row) => row.quote), [
+    '第一条 note 的原文',
+    '第二条 note 的原文',
+    '第三条 note 的原文',
+  ]);
+  assert.deepEqual(history.map((row) => row.status), ['active', 'active', 'active']);
+});

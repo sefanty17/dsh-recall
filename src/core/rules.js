@@ -60,6 +60,24 @@ const IDENT_RE = new RegExp(IDENT_SRC, 'g');
  */
 const VALUE_IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._@/:\-]{1,39}$/;
 
+/** 命令类 key：value 允许单个空格（cargo test / go build ./...） */
+const COMMAND_KEYS = new Set(['test-command', 'build-command', 'deploy']);
+
+/**
+ * 命令形态的 value：字母/数字开头，可含 . _ @ / : - 与单个空格；
+ * 不允许结尾空格、连续两个空格，长度 ≤60。
+ */
+const VALUE_COMMAND_RE = /^[A-Za-z0-9][A-Za-z0-9._@/:\- ]{0,59}$/;
+
+function isCommandValue(value) {
+  return typeof value === 'string'
+    && value.length >= 2
+    && value.length <= 60
+    && VALUE_COMMAND_RE.test(value)
+    && !value.endsWith(' ')
+    && !value.includes('  ');
+}
+
 /** 引号括起来的整段（中文引号/日文引号/反引号/单双引号） */
 const QUOTED_RE = /[`"'\u300c\u300e]([^`"'\u300d\u300f\n]{1,40})[`"'\u300d\u300f]/;
 
@@ -68,11 +86,24 @@ const QUOTE_OPEN = '`"\'「『';
 /** 动词 + 紧随其后的整段引文，优先于裸标识符 */
 const VERB_QUOTED_RE = /(?:切换到|切换成|切到|改成|改为|换成|改用|换到|使用|采用|走|用|\b(?:install|switch(?:ing)?\s+to|migrate\s+to|adopt|use)\b)\s*[`"'「『]([^`"'」』\n]{1,40})[`"'」』]/i;
 
+/** 触发动词（中英） */
+const VERB_SRC = '(?:切换到|切换成|切到|改成|改为|换成|改用|换到|使用|采用|走|用'
+  + '|\\b(?:install|switch(?:ing)?\\s+to|migrate\\s+to|adopt|use)\\b)';
+
 /** 动词 + 紧随其后的标识符（value 抽取的主力） */
 const VERB_VALUE_RE = new RegExp(
-  '(?:切换到|切换成|切到|改成|改为|换成|改用|换到|使用|采用|走|用'
-    + '|\\b(?:install|switch(?:ing)?\\s+to|migrate\\s+to|adopt|use)\\b)'
-    + '\\s*[' + QUOTE_OPEN + ']?(' + IDENT_SRC + ')',
+  VERB_SRC + '\\s*[' + QUOTE_OPEN + ']?(' + IDENT_SRC + ')',
+  'i',
+);
+
+/** 命令 token：命令名 / 子命令 / flag / 路径 */
+const COMMAND_TOKEN_SRC = '[A-Za-z0-9._@/:\\-]+';
+/** 命令值：最多 3 个 token，单空格分隔（cargo test / go build ./...） */
+const COMMAND_VALUE_SRC = '[A-Za-z0-9][A-Za-z0-9._@/:\\-]{0,39}(?: ' + COMMAND_TOKEN_SRC + '){0,2}';
+
+/** 动词 + 命令（仅命令类 key 使用） */
+const VERB_COMMAND_RE = new RegExp(
+  VERB_SRC + '\\s*[' + QUOTE_OPEN + ']?(' + COMMAND_VALUE_SRC + ')',
   'i',
 );
 
@@ -306,9 +337,9 @@ function isQuotedValue(value) {
 
 /**
  * 抽 value；只返回「合格」的值，抽不出就返回 null（候选会被丢弃）。
- * 顺序：失败前缀 -> 动词+引文 -> 动词+标识符 -> 引文 -> 标识符。
+ * 顺序：失败前缀 -> 动词+引文 -> 动词+命令（仅命令类 key）-> 动词+标识符 -> 引文 -> 标识符。
  */
-function findValue(quote, matchRel, kind) {
+function findValue(quote, matchRel, kind, keyHint) {
   const after = quote.slice(matchRel);
 
   if (kind === 'failure') {
@@ -320,6 +351,15 @@ function findValue(quote, matchRel, kind) {
   if (verbQuoted && verbQuoted[1]) {
     const value = cleanValue(verbQuoted[1]);
     if (value && isQuotedValue(value)) return value;
+  }
+
+  // 命令类 key 允许单空格 value，例如 cargo test / go build ./...
+  if (COMMAND_KEYS.has(keyHint)) {
+    const command = VERB_COMMAND_RE.exec(after);
+    if (command && command[1]) {
+      const value = command[1].trim();
+      if (isCommandValue(value)) return value;
+    }
   }
 
   const verb = VERB_VALUE_RE.exec(after);
@@ -387,10 +427,12 @@ function buildCandidate(text, matchStart, matchLength, rule) {
   if (!quote) return null;
 
   const matchRel = Math.max(0, matchStart - start);
-  const value = findValue(quote, matchRel, rule.kind);
+  const triggerEnd = matchRel + matchLength - 1;
+  // 先定 keyHint（只依赖 quote 与触发词），再按槽位形态抽 value
+  let keyHint = keyHintFor(rule.kind, quote, matchRel, triggerEnd);
+  const value = findValue(quote, matchRel, rule.kind, keyHint);
   if (!value) return null;
 
-  let keyHint = keyHintFor(rule.kind, quote, matchRel, matchRel + matchLength - 1);
   // typed key 的 value 不在槽位取值域内 -> 降级为 note（保留 kind/quote/evidence）
   const validator = VALUE_VALIDATORS[keyHint];
   if (validator && !validator.test(value)) keyHint = 'note';
